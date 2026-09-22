@@ -1,155 +1,186 @@
 from __future__ import annotations
 
-import contextlib
+import os
 import sys
-from functools import lru_cache
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING
 
-from polars._utils.parse import parse_into_list_of_expressions
-from polars._utils.wrap import wrap_expr
-
-with contextlib.suppress(ImportError):  # Module not available when building docs
-    import polars._plr as plr
+import polars._reexport as pl
+from polars._utils.unstable import unstable
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterator
 
-    from polars import Expr
-    from polars._typing import IntoExpr
-
-__all__ = ["register_plugin_function"]
+    from polars import DataFrame, Expr, LazyFrame
+    from polars._typing import SchemaDict
 
 
-def register_plugin_function(
+@unstable()
+def register_io_source(
+    io_source: Callable[
+        [list[str] | None, Expr | None, int | None, int | None], Iterator[DataFrame]
+    ],
     *,
-    plugin_path: Path | str,
-    function_name: str,
-    args: IntoExpr | Iterable[IntoExpr],
-    kwargs: dict[str, Any] | None = None,
-    is_elementwise: bool = False,
-    changes_length: bool = False,
-    returns_scalar: bool = False,
-    cast_to_supertype: bool = False,
-    input_wildcard_expansion: bool = False,
-    pass_name_to_apply: bool = False,
-    use_abs_path: bool = False,
-) -> Expr:
+    schema: Callable[[], SchemaDict] | SchemaDict,
+    validate_schema: bool = False,
+    is_pure: bool = False,
+) -> LazyFrame:
     """
-    Register a plugin function.
+    Register your IO plugin and initialize a LazyFrame.
 
-    See the `user guide <https://docs.pola.rs/user-guide/plugins/expr_plugins>`_
+    See the `user guide <https://docs.pola.rs/user-guide/plugins/io_plugins>`_
     for more information about plugins.
+
+    .. warning::
+        This functionality is considered **unstable**. It may be changed
+        at any point without it being considered a breaking change.
+
 
     Parameters
     ----------
-    plugin_path
-        Path to the plugin package. Accepts either the file path to the dynamic library
-        file or the path to the directory containing it.
-    function_name
-        The name of the Rust function to register.
-    args
-        The arguments passed to this function. These get passed to the `input`
-        argument on the Rust side, and have to be expressions (or be convertible
-        to expressions).
-    kwargs
-        Non-expression arguments to the plugin function. These must be
-        JSON serializable.
-    is_elementwise
-        Indicate that the function operates on scalars only. This will potentially
-        trigger fast paths.
-    changes_length
-        Indicate that the function will change the length of the expression.
-        For example, a `unique` or `slice` operation.
-    returns_scalar
-        Automatically explode on unit length if the function ran as final aggregation.
-        This is the case for aggregations like `sum`, `min`, `covariance` etc.
-    cast_to_supertype
-        Cast the input expressions to their supertype.
-    input_wildcard_expansion
-        Expand wildcard expressions before executing the function.
-    pass_name_to_apply
-        If set to `True`, the `Series` passed to the function in a group-by operation
-        will ensure the name is set. This is an extra heap allocation per group.
-    use_abs_path
-        If set to `True`, the path will be resolved to an absolute path.
-        The path to the dynamic library is relative to the virtual environment by
-        default.
+    io_source
+        Function that accepts the following arguments:
+            with_columns
+                Columns that are projected. The reader must
+                project these columns if applied
+            predicate
+                Polars expression. The reader must filter
+                their rows accordingly.
+            n_rows
+                Materialize only n rows from the source.
+                The reader can stop when `n_rows` are read.
+            batch_size
+                A hint of the ideal batch size the reader's
+                generator must produce.
+
+        The function should return a an iterator/generator
+        that produces DataFrames.
+    schema
+        Schema or function that when called produces the schema that the reader
+        will produce before projection pushdown.
+    validate_schema
+        Whether the engine should validate if the batches generated match
+        the given schema. It's an implementation error if this isn't
+        the case and can lead to bugs that are hard to solve.
+    is_pure
+        Whether the IO source is pure. Repeated occurrences of same IO source in
+        a LazyFrame plan can be de-duplicated during optimization if they are
+        pure.
 
     Returns
     -------
-    Expr
-
-    Warnings
-    --------
-    This is highly unsafe as this will call the C function loaded by
-    `plugin::function_name`.
-
-    The parameters you set dictate how Polars will handle the function.
-    Make sure they are correct!
+    LazyFrame
     """
-    pyexprs = parse_into_list_of_expressions(args)
-    serialized_kwargs = _serialize_kwargs(kwargs)
-    plugin_path = _resolve_plugin_path(plugin_path, use_abs_path=use_abs_path)
 
-    return wrap_expr(
-        plr.register_plugin_function(
-            plugin_path=str(plugin_path),
-            function_name=function_name,
-            args=pyexprs,
-            kwargs=serialized_kwargs,
-            is_elementwise=is_elementwise,
-            input_wildcard_expansion=input_wildcard_expansion,
-            returns_scalar=returns_scalar,
-            cast_to_supertype=cast_to_supertype,
-            pass_name_to_apply=pass_name_to_apply,
-            changes_length=changes_length,
-        )
+    def wrap(
+        with_columns: list[str] | None,
+        predicate: bytes | None,
+        n_rows: int | None,
+        batch_size: int | None,
+    ) -> tuple[Iterator[DataFrame], bool]:
+        parsed_predicate_success = True
+        parsed_predicate = None
+        if predicate:
+            try:
+                parsed_predicate = pl.Expr.deserialize(predicate)
+            except Exception as e:
+                if os.environ.get("POLARS_VERBOSE"):
+                    print(
+                        f"failed parsing IO plugin expression\n\nfilter will be handled on Polars' side: {e}",
+                        file=sys.stderr,
+                    )
+                parsed_predicate_success = False
+
+        return io_source(
+            with_columns, parsed_predicate, n_rows, batch_size
+        ), parsed_predicate_success
+
+    return pl.LazyFrame._scan_python_function(
+        schema=schema,
+        scan_fn=wrap,
+        pyarrow=False,
+        validate_schema=validate_schema,
+        is_pure=is_pure,
     )
 
 
-def _serialize_kwargs(kwargs: dict[str, Any] | None) -> bytes:
-    """Serialize the function's keyword arguments."""
-    if not kwargs:
-        return b""
+@unstable()
+def _defer(
+    function: Callable[[], DataFrame],
+    *,
+    schema: SchemaDict | Callable[[], SchemaDict],
+    validate_schema: bool = True,
+) -> LazyFrame:
+    """
+    Deferred execution.
 
-    import pickle
+    Takes a function that produces a `DataFrame` but defers execution until the
+    `LazyFrame` is collected.
 
-    # Use the highest pickle protocol supported the serde-pickle crate:
-    # https://docs.rs/serde-pickle/latest/serde_pickle/
-    return pickle.dumps(kwargs, protocol=5)
+    Parameters
+    ----------
+    function
+        Function that takes no arguments and produces a `DataFrame`.
+    schema
+        Schema of the `DataFrame` the deferred function will return.
+        The caller must ensure this schema is correct.
+    validate_schema
+        Whether the engine should validate if the batches generated match
+        the given schema. It's an implementation error if this isn't
+        the case and can lead to bugs that are hard to solve.
+
+    Examples
+    --------
+    Delay DataFrame execution until query is executed.
+
+    >>> import numpy as np
+    >>> np.random.seed(0)
+    >>> lf = pl.defer(
+    ...     lambda: pl.DataFrame({"a": np.random.randn(3)}), schema={"a": pl.Float64}
+    ... )
+    >>> lf.collect()
+    shape: (3, 1)
+    ┌──────────┐
+    │ a        │
+    │ ---      │
+    │ f64      │
+    ╞══════════╡
+    │ 1.764052 │
+    │ 0.400157 │
+    │ 0.978738 │
+    └──────────┘
+
+     Run an eager source in Polars Cloud
+
+    >>> (
+    ...     pl.defer(
+    ...         lambda: pl.read_database("select * from tbl"),
+    ...         schema={"a": pl.Float64, "b": pl.Boolean},
+    ...     )
+    ...     .filter("b")
+    ...     .sum("a")
+    ...     .remote()
+    ...     .collect()
+    ... )  # doctest: +SKIP
 
 
-@lru_cache(maxsize=16)
-def _resolve_plugin_path(path: Path | str, *, use_abs_path: bool = False) -> Path:
-    """Get the file path of the dynamic library file."""
-    if not isinstance(path, Path):
-        path = Path(path)
+    """
 
-    if path.is_file():
-        return _resolve_file_path(path, use_abs_path=use_abs_path)
+    def source(
+        with_columns: list[str] | None,
+        predicate: Expr | None,
+        n_rows: int | None,
+        batch_size: int | None,  # noqa: ARG001
+    ) -> Iterator[DataFrame]:
+        lf = function().lazy()
+        if with_columns is not None:
+            lf = lf.select(with_columns)
+        if predicate is not None:
+            lf = lf.filter(predicate)
+        if n_rows is not None:
+            lf = lf.limit(n_rows)
+        yield lf._collect_eager()
 
-    for p in path.iterdir():
-        if _is_dynamic_lib(p):
-            return _resolve_file_path(p, use_abs_path=use_abs_path)
-
-    msg = f"no dynamic library found at path: {path}"
-    raise FileNotFoundError(msg)
-
-
-def _is_dynamic_lib(path: Path) -> bool:
-    return path.is_file() and path.suffix in (".so", ".dll", ".pyd")
-
-
-def _resolve_file_path(path: Path, *, use_abs_path: bool = False) -> Path:
-    venv_path = Path(sys.prefix)
-
-    if use_abs_path:
-        return path.resolve()
-    else:
-        try:
-            file_path = path.relative_to(venv_path)
-        except ValueError:  # Fallback
-            file_path = path.resolve()
-
-    return file_path
+    return register_io_source(
+        io_source=source, schema=schema, validate_schema=validate_schema
+    )
